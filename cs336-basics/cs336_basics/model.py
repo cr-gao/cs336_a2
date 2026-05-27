@@ -15,6 +15,8 @@ from torch import Tensor
 
 from cs336_basics.nn_utils import softmax
 
+import torch.cuda.nvtx as nvtx
+
 logger = logging.getLogger(__name__)
 
 
@@ -379,12 +381,13 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
-        attn_sublayer_output = x + x_attn
+        with nvtx.range("TransformerBlock forward"):
+            x_attn = self.attn(self.ln1(x))
+            attn_sublayer_output = x + x_attn
 
-        # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-        ffn_sublayer_output = attn_sublayer_output + x_ffn
+            # Apply the feed-forward sublayer
+            x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+            ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
 
@@ -433,6 +436,25 @@ def scaled_dot_product_attention(
 
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
+    with nvtx.range("computing attention scores"):
+        d_k = K.shape[-1]
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+        
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+        
+    with nvtx.range("final matmul"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    return output
 
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention

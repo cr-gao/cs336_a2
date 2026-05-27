@@ -1,9 +1,14 @@
 import argparse
-from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.model import BasicsTransformerLM, annotated_scaled_dot_product_attention
 from cs336_basics.optimizer import AdamW
 import torch
 from timeit import default_timer as timer
 from tqdm import tqdm
+import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
+
+import cs336_basics.model
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def main():
     MODEL_CONFIGS = {
@@ -49,6 +54,7 @@ def main():
     parser.add_argument('--mode', type=str, choices=['forward_only', 'forward_backward', 'full'], default='forward_only', help='Whether to benchmark forward pass or backward pass')
     parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='float32', help='Data type for model parameters and computations')
     parser.add_argument('--layer_type', type=str, default='standard', choices=['standard', 'optimized'], help="Which layer implementation to benchmark")
+    parser.add_argument('--profile_memory', action='store_true', help='Whether to profile memory usage with Nsight Systems')
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,41 +73,53 @@ def main():
     input_ids = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length)).to(device)
     targets = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length)).to(device)
     
+    ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if args.dtype == 'bfloat16' else nullcontext()
+    
     # Warmup steps
     for _ in tqdm(range(args.num_warmup), desc="Warmup"):
         optimizer.zero_grad()
-        outputs = model(input_ids)
-        loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
+        with ctx:
+            outputs = model(input_ids)
+            loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
         loss.backward()
         optimizer.step()
         
     torch.cuda.synchronize()
     
+    torch.cuda.cudart().cudaProfilerStart()
+    if args.profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+    
     step_times = []
-    for step in tqdm(range(args.num_steps), desc="Benchmark"):
+    for _ in tqdm(range(args.num_steps), desc="Benchmark"):
         start_time = timer()
         
-        if args.mode == 'forward_only':
-            with torch.no_grad():
-                outputs = model(input_ids)
-                loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
-        elif args.mode == 'forward_backward':
-            outputs = model(input_ids)
-            loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
-            loss.backward()
-        elif args.mode == 'full':
-            optimizer.zero_grad()
-            outputs = model(input_ids)
-            loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
-            loss.backward()
-            optimizer.step()
-            
+        with nvtx.range("full_step"):
+            with nvtx.range("forward_pass"):
+                with ctx:
+                    outputs = model(input_ids)
+                    loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
+            with nvtx.range("backward_pass"):
+                if args.mode in ['forward_backward', 'full']:
+                    loss.backward()
+            with nvtx.range("optimizer_step"):
+                if args.mode == 'full':
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
         torch.cuda.synchronize()
         end_time = timer()
         step_times.append(end_time - start_time)
         
+    torch.cuda.cudart().cudaProfilerStop()
+    if args.profile_memory:
+        torch.cuda.memory._dump_snapshot("profiles/memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        
     avg_time = sum(step_times) / len(step_times)
+    std = (sum((t - avg_time) ** 2 for t in step_times) / len(step_times)) ** 0.5
     print(f"Average time per step: {avg_time:.4f} seconds")
-    
+    print(f"Standard deviation: {std:.4f} seconds")
+
 if __name__ == "__main__":
     main()
