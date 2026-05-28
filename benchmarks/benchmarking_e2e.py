@@ -78,10 +78,17 @@ def main():
     # Warmup steps
     for _ in tqdm(range(args.num_warmup), desc="Warmup"):
         optimizer.zero_grad()
+        
+        torch.cuda.reset_peak_memory_stats()
+        
         with ctx:
             outputs = model(input_ids)
             loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
         loss.backward()
+        
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        print(f"Peak GPU Memory: {peak_memory_bytes / (1024**2):.2f} MiB")
+        
         optimizer.step()
         
     torch.cuda.synchronize()
@@ -94,6 +101,9 @@ def main():
     for _ in tqdm(range(args.num_steps), desc="Benchmark"):
         start_time = timer()
         
+        if not args.profile_memory:
+            torch.cuda.reset_peak_memory_stats()
+
         with nvtx.range("full_step"):
             with nvtx.range("forward_pass"):
                 with ctx:
@@ -102,6 +112,11 @@ def main():
             with nvtx.range("backward_pass"):
                 if args.mode in ['forward_backward', 'full']:
                     loss.backward()
+            
+            if not args.profile_memory:
+                peak_memory_bytes = torch.cuda.max_memory_allocated()
+                print(f"Peak GPU Memory: {peak_memory_bytes / (1024**2):.2f} MiB")
+            
             with nvtx.range("optimizer_step"):
                 if args.mode == 'full':
                     optimizer.step()

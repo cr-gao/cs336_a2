@@ -16,6 +16,7 @@ from torch import Tensor
 from cs336_basics.nn_utils import softmax
 
 import torch.cuda.nvtx as nvtx
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -249,10 +250,56 @@ class BasicsTransformerLM(nn.Module):
         # (batch size, sequence_length, d_model)
         # x = self.positional_encoder(embedded_tokens, positions)
         x = embedded_tokens
+        
+        total_size_bytes = 0
+        def pack_hook(t):
+            if isinstance(t, torch.nn.Parameter):  # Skip logging parameters to avoid double counting
+                return t
+            nonlocal total_size_bytes
+            shape, dtype, grad_fn = t.shape, t.dtype, t.grad_fn
+            total_size_bytes += t.numel() * t.element_size()
+            # print(f"Saving residual: {shape=}, {dtype=}, {grad_fn=}")
+            return t
 
-        for layer in self.layers:
-            # (batch size, sequence_length, d_model)
-            x = layer(x)
+        def unpack_hook(t):
+            shape, dtype, grad_fn = t.shape, t.dtype, t.grad_fn
+            # print(f"Loading residual: {shape=}, {dtype=}, {grad_fn=}")
+            return t
+        
+        def recursive_checkpoint(layer, x):
+            if len(layer) == 1:
+                return layer[0](x)
+            
+            mid = len(layer) // 2
+            left = lambda x: recursive_checkpoint(layer[:mid], x)
+            right = lambda x: recursive_checkpoint(layer[mid:], x)
+            
+            x = checkpoint(left, x)
+            x = checkpoint(right, x)
+            return x
+        
+        def grouped_layers(layers, x):
+            for layer in layers:
+                x = layer(x)
+            return x
+        
+        def grouped_checkpoint(layers, x):
+            group_size = 2048  # Adjusted to the best
+            for i in range(0, len(layers), group_size):
+                x = checkpoint(grouped_layers, layers[i:i+group_size], x)
+            return x
+        
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+            '''
+            for layer in self.layers:
+                # (batch size, sequence_length, d_model)
+                x = layer(x)
+            '''
+            # x = recursive_checkpoint(self.layers, x)
+            x = grouped_checkpoint(self.layers, x)
+                
+            # print(f"Total size of saved tensors in TransformerBlocks with checkpointing: {total_size_bytes / (1024**2):.2f} MiB")
+
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)
