@@ -11,6 +11,7 @@ import cs336_basics.model
 cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def main():
+    torch.set_float32_matmul_precision('high')
     MODEL_CONFIGS = {
         "small": {
             "d_model": 768,
@@ -55,6 +56,7 @@ def main():
     parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='float32', help='Data type for model parameters and computations')
     parser.add_argument('--layer_type', type=str, default='standard', choices=['standard', 'optimized'], help="Which layer implementation to benchmark")
     parser.add_argument('--profile_memory', action='store_true', help='Whether to profile memory usage with Nsight Systems')
+    parser.add_argument('--compiled', action='store_true', help='Whether to use torch.compile')
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -69,6 +71,13 @@ def main():
         context_length=args.context_length,
     ).to(device)
     optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    
+    if args.compiled:
+        print(">>> Using torch.compile() for end-to-end benchmarking...")
+        if args.num_warmup < 3:
+            print("WARNING: num_warmup is too low for torch.compile. Forcing num_warmup=5 to complete compilation.")
+            args.num_warmup = 5
+        model = torch.compile(model, backend="inductor")
     
     input_ids = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length)).to(device)
     targets = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length)).to(device)
