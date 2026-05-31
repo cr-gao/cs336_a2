@@ -155,8 +155,8 @@ def flash_fwd_kernel(
 
         row_max = tl.max(S_tile, axis=-1)
         m_tile = tl.maximum(m, row_max)
-        P_tile = tl.exp(S_tile - m_tile[:, None]).to(tl.float32)
-        alpha = tl.exp(m - m_tile).to(tl.float32)
+        P_tile = tl.exp(S_tile - m_tile[:, None]).to(V_tile.dtype)
+        alpha = tl.exp(m - m_tile)
         l = alpha * l + tl.sum(P_tile, axis=-1)
         out = alpha[:, None] * out + tl.dot(P_tile, V_tile)
         m = m_tile
@@ -164,7 +164,7 @@ def flash_fwd_kernel(
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
         
-    O = out / l[:, None]
+    O = (out / l[:, None]).to(Q.dtype)
     L = m + tl.log(l)
     tl.store(O_block_ptr, O)
     tl.store(L_block_ptr, L)
@@ -202,7 +202,13 @@ class FlashAttention2_Triton(torch.autograd.Function):
     
     @torch.compile
     def backward(ctx, dO):
+        dtype = dO.dtype
         L, Q, K, V, O = ctx.saved_tensors
+        L = L.to(dtype)
+        Q = Q.to(dtype)
+        K = K.to(dtype)
+        V = V.to(dtype)
+        O = O.to(dtype)
         D = (O * dO).sum(dim=-1)
         S = torch.matmul(Q, K.transpose(-2, -1)) / (Q.shape[-1] ** 0.5)
         
