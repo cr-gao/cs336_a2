@@ -1,4 +1,5 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -74,6 +75,7 @@ def main():
             })
             
     dataframe = pd.DataFrame(results)
+    os.create_dir("profiles", exist_ok=True)
     dataframe.to_csv("profiles/benchmark_dcsn.csv", index=False)
     print(dataframe)
     
