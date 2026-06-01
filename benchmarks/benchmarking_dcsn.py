@@ -75,7 +75,7 @@ def main():
             })
             
     dataframe = pd.DataFrame(results)
-    os.create_dir("profiles", exist_ok=True)
+    os.makedirs("profiles", exist_ok=True)
     dataframe.to_csv("profiles/benchmark_dcsn.csv", index=False)
     print(dataframe)
     
