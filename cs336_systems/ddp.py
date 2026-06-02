@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import time
 
-class DDP(torch.nn.Module):
+class NaiveDDP(torch.nn.Module):
     def __init__(self, module):
         super().__init__()
         
@@ -46,3 +46,33 @@ class DDP(torch.nn.Module):
                 grad_size = param.grad.numel()
                 param.grad.copy_(self.flattened_grads[grad_idx:grad_idx + grad_size].view_as(param.grad))
                 grad_idx += grad_size
+                
+class DDP(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        
+        self.module = module
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        
+        self.handles = []
+        for param in self.module.parameters():
+            dist.broadcast(param.data, src=0)
+
+            def allreduce_hook(p):
+                handle = dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, async_op=True)
+                self.handles.append(handle)
+                
+            if param.requires_grad:
+                param.register_post_accumulate_grad_hook(allreduce_hook)
+        
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+    
+    def sync_gradients(self, optimizer):
+        for handle in self.handles:
+            handle.wait()
+        for param in self.module.parameters():
+            if param.grad is not None:
+                param.grad /= self.world_size
+        self.handles.clear()
