@@ -2,11 +2,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import time
-import pandas as pd
 import os
 import argparse
 from contextlib import nullcontext
 from tqdm import tqdm
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
@@ -91,24 +91,33 @@ def benchmark_worker(rank, world_size, args):
     comm_times = []
     for _ in tqdm(range(args.num_steps)):
         torch.cuda.synchronize()
-        step_start = time.time()
         
-        with ctx:
-            outputs = model(input_ids)
-            loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
-        loss.backward()
-        
-        torch.cuda.synchronize()
-        comm_start = time.time()
-        model.sync_gradients(optimizer)
-        torch.cuda.synchronize()
-        comm_end = time.time()
-        
-        optimizer.step()
-        optimizer.zero_grad()
-        
-        torch.cuda.synchronize()
-        step_end = time.time()
+        with nvtx.range("full_step"):
+            step_start = time.time()
+            
+            with nvtx.range("forward"):
+                with ctx:
+                    outputs = model(input_ids)
+                    loss = torch.nn.functional.cross_entropy(outputs.view(-1, args.vocab_size), targets.view(-1))
+            
+            with nvtx.range("backward"):
+                loss.backward()
+            
+            torch.cuda.synchronize()
+            comm_start = time.time()
+            
+            with nvtx.range("gradient_sync"):
+                model.sync_gradients(optimizer)
+
+            torch.cuda.synchronize()
+            comm_end = time.time()
+            
+            with nvtx.range("optimizer_step"):
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            torch.cuda.synchronize()
+            step_end = time.time()
         
         step_times.append(step_end - step_start)
         comm_times.append(comm_end - comm_start)
