@@ -3,6 +3,9 @@ from __future__ import annotations
 import torch
 from cs336_systems.flashattention2 import FlashAttention2, FlashAttention2_Triton
 from cs336_systems.ddp import DDP
+from cs336_systems.optimizer_sharding import ShardedOptimizer
+from cs336_systems.fsdp import FSDP
+import torch.distributed as dist
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -89,8 +92,8 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
         Instance of an FSDP class.
     """
     # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
-
+    # raise NotImplementedError
+    return FSDP(module, compute_dtype=compute_dtype)
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
     """
@@ -104,21 +107,24 @@ def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.O
             Optimizer being used with the FSDP-wrapped model.
     """
     # For example: fsdp_model.finish_gradient_synchronization()
-    raise NotImplementedError
-
+    # raise NotImplementedError
+    fsdp_model.finish_gradient_synchronization()
 
 def fsdp_gather_full_params(fsdp_model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """
-    All-gather sharded parameters from the FSDP model to reconstruct full
-    parameter tensors. Replicated parameters are returned as-is.
-
-    Args:
-        fsdp_model: torch.nn.Module
-            FSDP-wrapped model.
-    Returns:
-        State dictionary mapping parameter names to full (unsharded) tensors.
-    """
-    raise NotImplementedError
+    result: dict[str, torch.Tensor] = {}
+    sharded_ids = set()
+    for layer in fsdp_model.fsdp_layers:
+        shard = layer.shard_param
+        sharded_ids.add(id(shard))
+        buf = [torch.empty_like(shard.data) for _ in range(layer.world_size)]
+        dist.all_gather(buf, shard.data.contiguous())
+        full = torch.cat(buf, dim=0)[: layer.orig_dim0].clone()
+        result[f"{layer.orig_name}.weight"] = full
+    for name, p in fsdp_model.module.named_parameters():
+        if id(p) in sharded_ids:
+            continue
+        result[name] = p.data.clone()
+    return result
 
 
 def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
@@ -137,4 +143,5 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    # raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)
