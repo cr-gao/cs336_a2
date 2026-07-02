@@ -1,487 +1,161 @@
-from __future__ import annotations
-
-import json
-import logging
-import math
-import os
-import warnings
-
-import einx
 import torch
 import torch.nn as nn
+import math
+
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from cs336_basics.nn_utils import softmax
-
 import torch.cuda.nvtx as nvtx
 from torch.utils.checkpoint import checkpoint
 
-logger = logging.getLogger(__name__)
-
-
 class Linear(nn.Module):
-    def __init__(self, d_in: int, d_out: int):
-        """A linear layer initialized with truncated normal fan-in fan-out.
-
-        Args:
-            d_in: int
-                The number of input features.
-            d_out: int
-                The number of output features.
-        """
-
+    def __init__(self, in_features, out_features, device=None, dtype=None):
+        '''
+        in_features: int  final dimension of the input
+        out_features: int  final dimension of the output
+        device: torch.device | None = None  Device to store the parameters on
+        dtype: torch.dtype | None = None  Data type of the parameters
+        '''
         super().__init__()
-        std = math.sqrt(2 / (d_in + d_out))
-        self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std), requires_grad=True
-        )
 
-    def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
-        return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")
-
-    def extra_repr(self):
-        return f"d_out={self.weight.shape[0]}, d_in={self.weight.shape[1]}"
-
-
+        self.weight = nn.Parameter(torch.empty((out_features, in_features), device=device, dtype=dtype))
+        
+        sigma = math.sqrt(2.0 / (in_features + out_features))
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=sigma, a = -3.0 * sigma, b = 3.0 * sigma)  
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weight.T
+    
 class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int):
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        '''
+        num_embeddings: int  Size of the vocabulary
+        embedding_dim: int  Dimension of the embedding vectors, i.e., d_model
+        device: torch.device | None = None  Device to store the parameters on
+        dtype: torch.dtype | None = None  Data type of the parameters
+        '''
         super().__init__()
-        std = 1.0
-        self.weight = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std), requires_grad=True
-        )
-
-    def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
-        return self.weight[token_ids, :]
-
-    def extra_repr(self):
-        return f"vocab_size={self.weight.shape[0]}, d={self.weight.shape[1]}"
-
-
+        
+        self.weight = nn.Parameter(torch.empty((num_embeddings, embedding_dim), device=device, dtype=dtype))
+    
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
+        
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        '''
+        Lookup the embedding vectors for the given token IDs
+        '''
+        return self.weight[token_ids]
+    
 class RMSNorm(nn.Module):
-    """
-    This module implements root mean square layer normalization, as
-    described in Eq. 4 of https://arxiv.org/abs/1910.07467
-
-    Args:
-        hidden_size: int
-            Dimensionality of the input to normalize.
-        eps: float, default is 1e-5
-            A value added to the denominator for numerical stability.
-
-    Returns:
-        FloatTensor of same shape as input.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-5,
-        device=None,
-    ):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        '''
+        Construct the RMSNorm module. This function should accept the following parameters:
+        d_model: int  Hidden dimension of the model
+        eps: float = 1e-5  Epsilon value for numerical stability
+        device: torch.device | None = None  Device to store the parameters on
+        dtype: torch.dtype | None = None  Data type of the parameters
+        '''
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, device=device))
-        self.eps = eps
-
-    def forward(self, x):
-        """
-        Args:
-            x: FloatTensor of shape `(batch_size, *)`.
-                The input to apply root mean square layer normalization on.
-
-        Returns:
-            FloatTensor of same shape as input
-        """
-        # NOTE: in practice, many implementations will
-        # manually upcast the input to fp32 here to prevent overflow when you
-        # square the input.
-        # https://github.com/pytorch/pytorch/issues/66707
-        in_dtype = x.dtype
-
-        x = x.to(torch.float32)
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = x * rms
-
-        return (self.weight * x).to(in_dtype)
-
-    def extra_repr(self):
-        return f"hidden_size={self.weight.shape[0]}, eps={self.eps}"
-
-
-class RotaryEmbedding(nn.Module):
-    def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
-        super().__init__()
-        self.register_buffer(
-            "_freq_cis_cache", RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
-        )
-        self._freq_cis_cache: Float[Tensor, "2 context_length half_dim"]
-
-    @staticmethod
-    def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
-        assert dim % 2 == 0
-
-        d = torch.arange(0, dim, 2) / dim
-        freqs = torch.tensor(theta) ** -d
-        t = torch.arange(context_length)
-
-        freqs = einsum(t, freqs, "t, f -> t f")
-
-        cos, sin = torch.cos(freqs), torch.sin(freqs)
-        return torch.stack((cos, sin))
-
-    def forward(
-        self, x: Float[Tensor, " ... seq d"], pos_ids: Int[Tensor, " ... seq"] | None
-    ) -> Float[Tensor, " ... seq d"]:
-        x1, x2 = rearrange(x, "... (half_d xy) -> xy ... half_d", xy=2).unbind(0)
-
-        # Standard
-        # cos, sin = self._freq_cis_cache[:, pos_ids, :]
-
-        # einx
-        if pos_ids is not None:
-            cos, sin = einx.get_at("cos_sin [pos] half_dim, ... -> cos_sin ... half_dim", self._freq_cis_cache, pos_ids)
-        else:
-            seq_len = x.size(-2)
-            cos, sin = self._freq_cis_cache[:, :seq_len, :].unbind(0)
-
-        # 2D rotation matrix applied to pairs in x
-        x1_rot = cos * x1 - sin * x2
-        x2_rot = sin * x1 + cos * x2
-        # result = einx.id("... x_half, ... x_half -> ... (x_half (1 + 1))", x1_rot, x2_rot).contiguous()
-        result = torch.concat((x1_rot, x2_rot), dim=-1)
-        return result
-
-    def extra_repr(self):
-        return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
-
-
-class BasicsTransformerLM(nn.Module):
-    """A Transformer language model.
-
-    Args:
-        vocab_size: int
-            The number of unique items in the output vocabulary to be predicted.
-        context_length: int,
-            The maximum number of tokens to process at once.
-        d_model: int
-            The dimensionality of the model embeddings and sublayer outputs.
-        num_layers: int
-            The number of Transformer layers to use.
-        num_heads: int
-            Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-        d_ff: int
-            Dimensionality of the feed-forward inner layer (section 3.3).
-
-    Returns:
-        FloatTensor of shape (batch size, sequence_length, vocab_size) with the
-        predicted unnormalized next-word distribution for each token.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        context_length: int,
-        d_model: int,
-        num_layers: int,
-        num_heads: int,
-        d_ff: int,
-        rope_theta: float | None = 10_000.0,
-    ):
-        # Store the model configuration for serialization / deserialization
-        self.config = {
-            k: v for k, v in locals().items() if k != "self" and not (k.startswith("__") and k.endswith("__"))
-        }
-        super().__init__()
-        self.context_length = context_length
+        
         self.d_model = d_model
-        self.token_embeddings = Embedding(vocab_size, d_model)
-        d_head = d_model // num_heads
-        self.positional_encoder = (
-            RotaryEmbedding(context_length, d_head, rope_theta) if rope_theta is not None else None
-        )
-
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    positional_encoder=self.positional_encoder,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        self.ln_final = RMSNorm(d_model)
-        self.lm_head = Linear(d_model, vocab_size)
-        # Tie the weights, since the paper mentions that "we share the same weight
-        # matrix between the two embedding layers and the pre-softmax linear transformation"
-        # self.lm_head.weight = self.token_embeddings.weight
-        # report number of parameters
-        logger.info(f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M")
-
-    def get_num_params(self) -> int:
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        return n_params
-
-    def forward(self, x: Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length vocab_size"]:
-        """
-        Args:
-            x: Input IDs for language modeling.
-
-        Returns: A FloatTensor of shape
-            (batch size, sequence_length, vocab_size) with the predicted unnormalized next-word
-            distribution for each token.
-        """
-        _, sequence_length = x.size()
-        # (batch size, sequence_length, d_model)
-        # NOTE: paper mentions "In the embedding layers, we multiply those
-        # weights by sqrt(d_model)", but we aren't doing that here.
-        embedded_tokens = self.token_embeddings(x)
-
-        # (batch size, sequence_length, d_model)
-        # x = self.positional_encoder(embedded_tokens, positions)
-        x = embedded_tokens
+        self.eps = eps
         
-        total_size_bytes = 0
-        def pack_hook(t):
-            if isinstance(t, torch.nn.Parameter):  # Skip logging parameters to avoid double counting
-                return t
-            nonlocal total_size_bytes
-            shape, dtype, grad_fn = t.shape, t.dtype, t.grad_fn
-            total_size_bytes += t.numel() * t.element_size()
-            # print(f"Saving residual: {shape=}, {dtype=}, {grad_fn=}")
-            return t
-
-        def unpack_hook(t):
-            shape, dtype, grad_fn = t.shape, t.dtype, t.grad_fn
-            # print(f"Loading residual: {shape=}, {dtype=}, {grad_fn=}")
-            return t
+        self.weight = nn.Parameter(torch.empty((d_model,), device=device, dtype=dtype))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+        '''
+        Process an input tensor of shape (batch_size, sequence_length, d_model) and return a tensor of the same shape.
+        '''
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
         
-        def recursive_checkpoint(layer, x):
-            if len(layer) == 1:
-                return layer[0](x)
-            
-            mid = len(layer) // 2
-            left = lambda x: recursive_checkpoint(layer[:mid], x)
-            right = lambda x: recursive_checkpoint(layer[mid:], x)
-            
-            x = checkpoint(left, x)
-            x = checkpoint(right, x)
-            return x
+        rms = torch.sqrt((1.0 / self.d_model) * torch.sum(x ** 2, dim=-1, keepdim=True) + self.eps)
+        result = x / rms * self.weight
         
-        def grouped_layers(layers, x):
-            for layer in layers:
-                x = layer(x)
-            return x
-        
-        def grouped_checkpoint(layers, x):
-            group_size = 2048  # Adjusted to the best
-            for i in range(0, len(layers), group_size):
-                x = checkpoint(grouped_layers, layers[i:i+group_size], x)
-            return x
-        
-        with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
-            '''
-            for layer in self.layers:
-                # (batch size, sequence_length, d_model)
-                x = layer(x)
-            '''
-            # x = recursive_checkpoint(self.layers, x)
-            x = grouped_checkpoint(self.layers, x)
-                
-            # print(f"Total size of saved tensors in TransformerBlocks with checkpointing: {total_size_bytes / (1024**2):.2f} MiB")
-
-        # (batch size, sequence_length, d_model)
-        x = self.ln_final(x)
-        # (batch size, sequence_length, vocab_size)
-        logits = self.lm_head(x)
-        return logits
-
-    @torch.no_grad()
-    def generate(
-        self,
-        x: torch.Tensor,
-        max_new_tokens: int,
-        temperature: float = 1.0,
-        top_k: int | None = None,
-        eos_token_id: int | None = None,
-    ):
-        """
-        Args:
-            x: LongTensor of shape `(1, sequence_length,)` or `(sequence_length, )`.
-                Input IDs to condition on when generating.
-            max_new_tokens: int
-                Maximum number of tokens to generate.
-            temperature: float
-                Temperature to use during generation.
-            top_k: int
-                If provided, only sample from the `top_k` vocab items (by probability).
-            eos_token_id: int
-                If provided, stop generation when we generate this ID.
-
-        Returns: A LongTensor of shape (max_new_tokens,) with the generated model output.
-        """
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        original_sequence_length = x.size(-1)
-        for _ in range(max_new_tokens):
-            # Take the last `context_length` tokens if the input is
-            # beyond the model's context length
-            x = x[:, -self.context_length :] if x.size(1) > self.context_length else x
-            # Get the logits from the model
-            logits = self.forward(x)
-            # Take the logits for the next token
-            next_token_logits = logits[:, -1]
-            # apply temperature scaling
-            temperature_scaled_next_token_logits = next_token_logits / temperature
-            # If top-k is provided, take the tokens with the highest score
-            if top_k:
-                topk_values, _ = torch.topk(
-                    temperature_scaled_next_token_logits,
-                    min(top_k, temperature_scaled_next_token_logits.size(-1)),
-                )
-                # Get the score of the kth item that we kept---items with lower scores should be masked.
-                threshold = topk_values[:, -1]
-                topk_mask = temperature_scaled_next_token_logits < threshold
-                temperature_scaled_next_token_logits.masked_fill(topk_mask, float("-inf"))
-            next_token_probabilities = softmax(temperature_scaled_next_token_logits, dim=-1)
-            next_token_id = torch.multinomial(next_token_probabilities, 1)
-            # End generation if we see the EOS token ID
-            if eos_token_id is not None and next_token_id.item() == eos_token_id:
-                break
-            x = torch.cat((x, next_token_id), dim=-1)
-        new_token_ids = x[:, original_sequence_length:]
-        return new_token_ids
-
-    @classmethod
-    def from_pretrained(cls, pretrained_model_path: str):
-        config_path = os.path.join(pretrained_model_path, "model_config.json")
-        with open(config_path) as f:
-            config = json.load(f)
-        model = cls(**config)
-        weights_path = os.path.join(pretrained_model_path, "model.pt")
-        state_dict = torch.load(weights_path)
-
-        # Remove _orig_mod. prefix that comes from serializing a compiled model
-        unwanted_prefix = "_orig_mod."
-        for k, _ in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        return model
-
-
-class TransformerBlock(nn.Module):
-    """A single Transformer layer.
-
-    This implements a single layer of the Transformer, as described in section 3.1
-    of the paper.
-
-    Args:
-        d_model: int
-            The dimensionality of the model embeddings and sublayer outputs.
-        num_heads: int
-            Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-        d_ff: int
-            Dimensionality of the feed-forward inner layer (section 3.3).
-
-    Returns:
-        FloatTensor of shape `(batch_size, sequence_length, d_model)`.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        d_ff: int,
-        positional_encoder: RotaryEmbedding | None,
-    ):
+        return result.to(in_dtype)
+    
+class SwiGLU_FFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
+        '''
+        Construct the SwiGLU_FFN module. This function should accept the following parameters:
+        d_model: int  Hidden dimension of the model
+        d_ff: int  Hidden dimension of the feedforward network
+        device: torch.device | None = None  Device to store the parameters on
+        dtype: torch.dtype | None = None  Data type of the parameters
+        '''
         super().__init__()
-        self.attn = CausalMultiHeadSelfAttention(
-            d_model=d_model,
-            num_heads=num_heads,
-            positional_encoder=positional_encoder,
-        )
-        self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
-        self.ln1 = RMSNorm(d_model)
-        self.ln2 = RMSNorm(d_model)
-
-    def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x: FloatTensor of shape `(batch_size, sequence_length, d_model)`.
-                The input to process with the Transformer block.
-
-        Returns:
-            FloatTensor of shape `(batch_size, sequence_length, d_model)`.
-        """
-        # NOTE: this is a pre-norm Transformer, and differs from the original
-        # description in the paper.
-        # Apply the multi-head self-attention sublayer
-        with nvtx.range("TransformerBlock forward"):
-            x_attn = self.attn(self.ln1(x))
-            attn_sublayer_output = x + x_attn
-
-            # Apply the feed-forward sublayer
-            x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-            ffn_sublayer_output = attn_sublayer_output + x_ffn
-        return ffn_sublayer_output
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, d_model: int, d_ff: int):
+        
+        self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''
+        Process an input tensor of shape (batch_size, sequence_length, d_model) and return a tensor of the same shape.
+        '''
+        gate = self.w1(x)
+        gate = gate * torch.sigmoid(gate)
+        
+        values = self.w3(x)
+        
+        return self.w2(gate * values)
+    
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        '''
+        Construct the RoPE module and create buffers if needed.
+        theta: float Θ value for the RoPE
+        d_k: int  dimension of query and key vectors
+        max_seq_len: int  Maximum sequence length that will be input
+        device: torch.device | None = None  Device to store the buffer on
+        '''
         super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=device) / d_k))
+        positions = torch.arange(max_seq_len, device=device)
+        angles = positions[:, None] * inv_freq[None, :]
+        
+        self.register_buffer('cos_cached', torch.cos(angles), persistent=False)
+        self.register_buffer('sin_cached', torch.sin(angles), persistent=False)
+        
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        '''
+        Process an input tensor of shape (..., seq_len, d_k) and return a tensor of the same shape. Note 
+        that you should tolerate x with an arbitrary number of batch dimensions. You should assume 
+        that the token positions are a tensor of shape (..., seq_len) specifying the token positions of x 
+        along the sequence dimension.
+        '''
+        x = x.reshape(*x.shape[:-1], self.d_k // 2, 2)
+        
+        cos = self.cos_cached[token_positions]
+        sin = self.sin_cached[token_positions]
+        
+        x1 = x[..., 0] * cos - x[..., 1] * sin
+        x2 = x[..., 0] * sin + x[..., 1] * cos
+        
+        new_x = torch.stack([x1, x2], dim=-1).reshape(*x.shape[:-2], self.d_k)
+        return new_x
 
-    def forward(self, x):
-        return self.w2(silu(self.w1(x)) * self.w3(x))
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    x_max = torch.max(x, dim=dim, keepdim=True).values
+    x_exp = torch.exp(x - x_max)
+    x_exp_sum = torch.sum(x_exp, dim=dim, keepdim=True)
+    
+    return x_exp / x_exp_sum
 
-
-def scaled_dot_product_attention(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys    d_k"],
-    V: Float[Tensor, " ... keys    d_v"],
-    mask: Bool[Tensor, " ... queries keys"] | None = None,
-) -> Float[Tensor, " ... queries d_v"]:
-    """Scaled dot-product attention.
-
-    This function implements Eq. 1 of the Transformer paper.
-
-    Args:
-        Q: Tensor of queries, may have any number of leading dimensions.
-        K: Tensor of keys, sharing leading dimensions with Q.
-        V: Tensor of values, sharding leading dimensions with Q and K.
-        mask: An (optional) mask of shape (..., seq_len, seq_len).
-            Attention scores for positions with a mask value of `False` should
-            be masked out, i.e., not affect the softmaxed attention probabilities.
-
-    Returns:
-        torch.FloatTensor of shape (..., seq_len, value_dimension)
-        with the output of running your scaled dot product attention
-        implementation with the provided key, query, and value tensors.
-    """
-
-    d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
-
+def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    d_k = q.shape[-1]
+    pre_softmax = (q @ k.transpose(-2, -1)) / math.sqrt(d_k)
+    
     if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
-
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
-
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+        pre_softmax = pre_softmax.masked_fill(mask == 0, float('-inf'))
+        
+    attention_weights = softmax(pre_softmax, dim=-1)
+    return attention_weights @ v
 
 def annotated_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
@@ -503,99 +177,127 @@ def annotated_scaled_dot_product_attention(
         output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
     return output
 
-class CausalMultiHeadSelfAttention(nn.Module):
-    """Multi-Head Self-Attention
-
-    This function implements section 3.2.2 of the Transformer paper. In particular,
-    given an input tensor of shape `(batch_size, sequence_length, d_model)`, we project
-    it to create queries, keys, and values, and then perform causal multi-headed attention with
-    those queries, keys, and values.
-
-    Args:
-        d_model: int
-            The dimensionality of the model embeddings and sublayer outputs.
-        num_heads: int
-            Number of heads to use in multi-headed attention. `d_model` must be
-            evenly divisible by `num_heads`.
-
-    Returns:
-        Tensor of shape `(batch_size, sequence_length, d_model)`.
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        positional_encoder: RotaryEmbedding | None = None,
-    ):
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, use_rope: bool, theta: float | None=None, max_seq_len: int | None=None, device=None, dtype=None):
         super().__init__()
-        if positional_encoder is None:
-            warnings.warn("No positional encoder provided", stacklevel=2)
-        assert d_model % num_heads == 0
+        
         self.d_model = d_model
         self.num_heads = num_heads
-
-        self.d_k = d_model // num_heads
-        self.d_v = self.d_k
-
-        self.q_proj = Linear(self.d_model, self.num_heads * self.d_k)
-        self.k_proj = Linear(self.d_model, self.num_heads * self.d_k)
-        self.v_proj = Linear(self.d_model, self.num_heads * self.d_v)
-
-        self.output_proj = Linear(self.num_heads * self.d_v, self.d_model)
-
-        self.positional_encoder: RotaryEmbedding | None = positional_encoder  # RoPE
-
-    def forward(
-        self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None
-    ) -> Float[Tensor, " ... seq d_v"]:
-        """
-        Args:
-            x: The input to perform multi-headed self-attention on.
-            positional_ids: The positional indices along the sequence dimension of the input embeddings.
-
-        Returns:
-            Self-attention outputs.
-        """
-        *batch_dims, sequence_length, d_model = x.size()
-        assert d_model == self.d_model
-
+        self.use_rope = use_rope
+        
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        
+        if use_rope:
+            self.rope = RotaryPositionalEmbedding(theta=theta or 10000.0, d_k=d_model // num_heads, max_seq_len=max_seq_len or 2048, device=device)
+    
+    def forward(self, 
+                x: torch.Tensor, 
+                token_positions: torch.Tensor, 
+                past_k=None, 
+                past_v=None, 
+                use_cache=False) -> torch.Tensor:
         Q = self.q_proj(x)
         K = self.k_proj(x)
         V = self.v_proj(x)
+        
+        d_k = self.d_model // self.num_heads
+        [B, T, _] = x.shape
+        Q = Q.view(B, T, self.num_heads, d_k).transpose(1, 2).contiguous()
+        K = K.view(B, T, self.num_heads, d_k).transpose(1, 2).contiguous()
+        V = V.view(B, T, self.num_heads, d_k).transpose(1, 2).contiguous()
+        
+        if self.use_rope:
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
+            
+        if past_k is not None and past_v is not None:
+            K = torch.cat([past_k, K], dim=-2)
+            V = torch.cat([past_v, V], dim=-2)
+        
+        causal_mask = torch.triu(torch.ones((T, T), device=x.device), diagonal=1).bool()
+        causal_mask = ~causal_mask
+        
+        attention_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+        attention_output = attention_output.transpose(1, 2).reshape(B, T, self.d_model)
+        
+        output = self.o_proj(attention_output)
 
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
-
-        if self.positional_encoder is not None:  # RoPE is enabled
-            if token_positions is not None:  # We got explicit position ids
-                # Duplicate token positions for each head
-                token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
-
-            Q = self.positional_encoder(Q, token_positions)
-            K = self.positional_encoder(K, token_positions)
-
-        # Construct causal mask
-        iota = torch.arange(sequence_length, device=x.device)
-        qi = rearrange(iota, "query -> query 1")
-        kj = rearrange(iota, "key   -> 1   key")
-        causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
-
-        # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
-
-        # Concatenate the attention output from all heads.
-        # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
-
-        # Apply the output projection
-        output = self.output_proj(attn_output)
+        if use_cache:
+            return output, K, V
         return output
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, use_rope: bool, theta: float | None=None, max_seq_len: int | None=None, device=None, dtype=None):
+        super().__init__()
+        
+        self.attention = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, use_rope=use_rope, theta=theta, max_seq_len=max_seq_len, device=device, dtype=dtype)
+        self.ffn = SwiGLU_FFN(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
+        self.norm1 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.norm2 = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+    
+    def forward(self, 
+                x: torch.Tensor, 
+                token_positions: torch.Tensor, 
+                past_k=None, 
+                past_v=None, 
+                use_cache=False) -> torch.Tensor:
+        if use_cache:
+            attn_output, K, V = self.attention(self.norm1(x), token_positions, past_k=past_k, past_v=past_v, use_cache=use_cache)
+        else:
+            attn_output = self.attention(self.norm1(x), token_positions)
+        x = x + attn_output
+        
+        ffn_output = self.ffn(self.norm2(x))
+        x = x + ffn_output
+        
+        if use_cache:
+            return x, K, V
+        return x
+    
+class BasicsTransformerLM(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, vocab_size: int, context_length: int, num_layers: int, use_rope: bool | None=True, theta: float | None=None, max_seq_len: int | None=None, device=None, dtype=None):
+        super().__init__()
+        
+        self.token_embedding = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model=d_model, num_heads=num_heads, d_ff=d_ff, use_rope=use_rope, theta=theta, max_seq_len=context_length, device=device, dtype=dtype)
+            for _ in range(num_layers)
+        ])
+        self.norm = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.output_projection = Linear(d_model, vocab_size, device=device, dtype=dtype)
+        
+    def forward(self, 
+                token_ids: torch.Tensor, 
+                kv_cache=None, 
+                use_cache=False) -> torch.Tensor:
+        x = self.token_embedding(token_ids)
+        
+        if kv_cache is not None:
+            assert use_cache, "kv_cache provided but use_cache is False"
+            assert len(kv_cache) == len(self.layers), "Length of kv_cache must match number of layers"
+            past_length = kv_cache[0][0].shape[-2]
+            token_positions = torch.arange(past_length, past_length + token_ids.shape[-1], device=token_ids.device)
+        else:
+            token_positions = torch.arange(token_ids.shape[-1], device=token_ids.device)
 
-def silu(x: torch.Tensor):
-    return x * torch.sigmoid(x)
+        new_kv_cache = []
+        for i, layer in enumerate(self.layers):
+            if kv_cache is not None:
+                past_k, past_v = kv_cache[i]
+                x, K, V = layer(x, token_positions, past_k=past_k, past_v=past_v, use_cache=use_cache)
+                new_kv_cache.append((K, V))
+            elif use_cache:
+                x, K, V = layer(x, token_positions, use_cache=use_cache)
+                new_kv_cache.append((K, V))
+            else:
+                x = layer(x, token_positions)
+        
+        x = self.norm(x)
+        logits = self.output_projection(x)
+        if use_cache:
+            return logits, new_kv_cache
+        return logits
+        
